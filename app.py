@@ -7,7 +7,7 @@ from pypdf import PdfReader
 from docx import Document
 
 APP_TITLE = "📚 AI Study Pack Generator"
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash"
 
 st.set_page_config(page_title="AI Study Pack Generator", page_icon="📚", layout="wide")
 
