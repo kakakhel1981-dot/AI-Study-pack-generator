@@ -8,7 +8,7 @@ from pathlib import Path
 # Streamlit UI for Streamlit Cloud deployment
 # ============================================================
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 
 def get_api_key():
