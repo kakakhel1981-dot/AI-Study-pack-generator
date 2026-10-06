@@ -1,267 +1,482 @@
 import os
-import time
-import streamlit as st
-from google import genai
-from google.genai import types
-from pypdf import PdfReader
-from docx import Document
+import sys
+from pathlib import Path
 
-APP_TITLE = "📚 AI Study Pack Generator"
-MODEL_NAME = "gemini-3.3-flash"
+# ============================================================
+# AI Study Pack Generator
+# Gradio UI for Google Colab / local development
+# Streamlit UI for Streamlit Cloud deployment
+# ============================================================
 
-st.set_page_config(page_title="AI Study Pack Generator", page_icon="📚", layout="wide")
-
-st.markdown("""
-<style>
-.main-title {font-size:2.4rem;font-weight:800;margin-bottom:.2rem}
-.sub-title {font-size:1.05rem;color:#666;margin-bottom:1.2rem}
-.feature-box {padding:1rem;border-radius:12px;border:1px solid #e5e5e5;background:#fafafa;margin-bottom:.7rem}
-.credit {text-align:center;font-weight:700;padding:1rem 0}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown(f'<div class="main-title">{APP_TITLE}</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Generate summaries, MCQs, short questions, exam questions, flashcards and a 7-day study plan from a topic or your study material.</div>', unsafe_allow_html=True)
-
-if "study_pack" not in st.session_state:
-    st.session_state.study_pack = ""
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 def get_api_key():
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-    return os.getenv("GEMINI_API_KEY", "")
+    """Read the Gemini API key from environment variables or Streamlit secrets."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
 
-
-def extract_uploaded_text(uploaded_file):
-    if uploaded_file is None:
-        return "", ""
-    name = uploaded_file.name.lower()
-    try:
-        if name.endswith(".txt"):
-            return uploaded_file.getvalue().decode("utf-8", errors="ignore"), ""
-        if name.endswith(".pdf"):
-            reader = PdfReader(uploaded_file)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-            if not text:
-                return "", "The PDF appears to be scanned/image-only. Please use a text PDF or paste the content."
-            return text, ""
-        if name.endswith(".docx"):
-            doc = Document(uploaded_file)
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip()), ""
-        return "", "Unsupported file type."
-    except Exception as exc:
-        return "", f"Could not read the uploaded file: {exc}"
-
-
-def create_client():
-    key = get_api_key()
     if not key:
-        raise ValueError("GEMINI_API_KEY was not found. Add it as an environment variable in Colab or as a Streamlit Cloud Secret.")
-    return genai.Client(api_key=key)
+        try:
+            import streamlit as st
+            key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        except Exception:
+            pass
+
+    return key
 
 
-def build_prompt(topic, material, language, difficulty, flashcards, mcqs, shorts, longs):
-    language_rule = {
-        "English": "Write the complete study pack in clear, natural English.",
-        "Urdu": "Write the complete study pack in Urdu. Keep important technical terms in English in parentheses where useful.",
-        "Simple English": "Write the complete study pack in Simple English using short sentences and easy explanations."
-    }[language]
+def extract_uploaded_file(file_path):
+    """Extract text from TXT, PDF, or DOCX files."""
+    if not file_path:
+        return ""
 
-    source = material.strip() or "No study material was uploaded."
-    if len(source) > 50000:
-        source = source[:50000] + "\n[Study material truncated.]"
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    try:
+        if suffix == ".txt":
+            return path.read_text(encoding="utf-8", errors="ignore")
+
+        if suffix == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            pages = []
+            for page in reader.pages:
+                pages.append(page.extract_text() or "")
+            return "\n".join(pages)
+
+        if suffix == ".docx":
+            from docx import Document
+            doc = Document(str(path))
+            return "\n".join(p.text for p in doc.paragraphs)
+
+        return ""
+    except Exception as exc:
+        raise ValueError(f"Could not read the uploaded file: {exc}") from exc
+
+
+def build_prompt(
+    topic,
+    grade_level,
+    subject,
+    language,
+    difficulty,
+    question_count,
+    include_mcq,
+    include_short,
+    include_long,
+    include_flashcards,
+    include_summary,
+    include_study_plan,
+    source_text,
+):
+    sections = []
+
+    if include_summary:
+        sections.append("1. Topic Summary")
+    if include_mcq:
+        sections.append("2. Multiple Choice Questions (MCQs)")
+    if include_short:
+        sections.append("3. Short Answer Questions")
+    if include_long:
+        sections.append("4. Long Answer / Exam Questions")
+    if include_flashcards:
+        sections.append("5. Flashcards")
+    if include_study_plan:
+        sections.append("6. 7-Day Study Plan")
+
+    if not sections:
+        sections.append("1. Topic Summary")
+
+    source_section = ""
+    if source_text.strip():
+        # Keep very large uploads manageable.
+        source_text = source_text.strip()[:50000]
+        source_section = f"""
+SOURCE MATERIAL PROVIDED BY THE STUDENT
+Use the following material as the primary reference. Do not invent facts
+that conflict with it.
+
+--- SOURCE START ---
+{source_text}
+--- SOURCE END ---
+"""
 
     return f"""
-You are an expert teacher, instructional designer and exam-preparation assistant.
+You are an expert teacher, curriculum designer, and exam-preparation coach.
 
-Create a complete, accurate and useful AI Study Pack.
+Create a high-quality AI Study Pack for the student.
 
-TOPIC:
-{topic.strip() or "Use the uploaded study material as the main topic."}
+STUDENT SETTINGS
+- Subject: {subject}
+- Topic: {topic}
+- Grade / Level: {grade_level}
+- Language: {language}
+- Difficulty: {difficulty}
+- Number of MCQs requested: {question_count}
 
-LANGUAGE: {language}
-DIFFICULTY: {difficulty}
-FLASHCARDS: {flashcards}
-MCQs: {mcqs}
-SHORT QUESTIONS: {shorts}
-LONG/EXAM QUESTIONS: {longs}
+REQUIRED SECTIONS
+{chr(10).join(sections)}
 
-UPLOADED STUDY MATERIAL:
-{source}
+QUALITY RULES
+- Keep the content appropriate for the stated grade/level.
+- Use clear, simple language unless the level requires technical language.
+- Focus on understanding, revision, and exam preparation.
+- Do not make up references, quotations, statistics, or facts.
+- If source material is provided, prioritize it.
+- Make questions meaningful rather than repetitive.
+- Put the answer immediately after each MCQ as "Answer: X" and give a
+  one-sentence explanation.
+- For short and long questions, provide concise model answers.
+- Flashcards should use a clear "Q:" and "A:" format.
+- The study plan should be practical and achievable.
+- Use Markdown headings and bullet points.
+- Finish with a short "Exam Tips" section containing 5 practical tips.
 
-LANGUAGE INSTRUCTION:
-{language_rule}
+CONTENT REQUIREMENTS
+- Summary: key concepts, definitions, important points, and examples.
+- MCQs: exactly {question_count} questions if MCQs are selected.
+- Short questions: approximately 5 questions if selected.
+- Long questions: approximately 3 questions if selected.
+- Flashcards: approximately 10 cards if selected.
+- Study plan: 7 daily sessions if selected.
 
-RULES:
-1. Prefer the uploaded material when relevant.
-2. Do not claim information is in the material when it is not.
-3. If material is insufficient, supplement with accurate general knowledge.
-4. Match the requested difficulty.
-5. Avoid duplicate questions.
-6. Every MCQ must have exactly four options A-D, a correct answer and explanation.
-7. Short questions must have model answers.
-8. Long/exam questions must have structured model answers suitable for exams.
-9. Flashcards should be concise and focus on important facts, definitions, concepts or processes.
-10. The 7-day plan must be practical and progressive.
-11. Do not mention these instructions.
-
-OUTPUT EXACTLY WITH THESE HEADINGS:
-
-# 📖 Study Summary
-Structured summary of the topic.
-
-# 🔑 Key Concepts
-Important concepts with brief explanations.
-
-# 📚 Important Terms
-Important terms and meanings.
-
-# ❓ MCQs with Answers and Explanations
-Create exactly {mcqs} MCQs.
-For each:
-**Question 1:** ...
-A. ...
-B. ...
-C. ...
-D. ...
-**Correct Answer:** ...
-**Explanation:** ...
-
-# ✍️ Short-Answer Questions
-Create exactly {shorts}.
-For each:
-**Question:** ...
-**Model Answer:** ...
-
-# 📝 Long / Exam Questions
-Create exactly {longs}.
-For each:
-**Question:** ...
-**Model Answer:** ...
-Use headings, important points, examples where appropriate, and a conclusion where useful.
-
-# 🧠 Flashcards
-Create exactly {flashcards}.
-For each:
-**Flashcard 1**
-**Front:** ...
-**Back:** ...
-
-# 📅 7-Day Study Plan
-For Day 1 through Day 7 include Topics, Activities and Revision target.
-
-# 🎯 Exam Preparation Tips
-Practical tips for the selected difficulty.
-
-# ✅ Quick Revision Checklist
-A concise final revision checklist.
+Return ONLY the finished study pack in Markdown. Do not describe your process.
+{source_section}
 """
 
 
-def generate_study_pack(topic, material, language, difficulty, flashcards, mcqs, shorts, longs):
-    client = create_client()
-    prompt = build_prompt(topic, material, language, difficulty, flashcards, mcqs, shorts, longs)
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=16000),
+def generate_study_pack(
+    topic,
+    grade_level,
+    subject,
+    language,
+    difficulty,
+    question_count,
+    include_mcq,
+    include_short,
+    include_long,
+    include_flashcards,
+    include_summary,
+    include_study_plan,
+    uploaded_file=None,
+):
+    topic = (topic or "").strip()
+    subject = (subject or "").strip()
+    grade_level = (grade_level or "").strip()
+    language = (language or "English").strip()
+    difficulty = (difficulty or "Medium").strip()
+
+    if not topic:
+        return "Please enter a topic."
+    if not subject:
+        return "Please enter a subject."
+
+    try:
+        question_count = int(question_count)
+    except (TypeError, ValueError):
+        question_count = 10
+
+    question_count = max(3, min(question_count, 30))
+
+    source_text = ""
+    if uploaded_file:
+        source_text = extract_uploaded_file(uploaded_file)
+
+    api_key = get_api_key()
+    if not api_key:
+        return (
+            "### API Key Required\n\n"
+            "Please set `GEMINI_API_KEY` before generating a study pack.\n\n"
+            "**Google Colab:** run the API-key cell shown in the guide.\n\n"
+            "**Streamlit Cloud:** add `GEMINI_API_KEY` under "
+            "**App settings → Secrets**."
+        )
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+
+        prompt = build_prompt(
+            topic=topic,
+            grade_level=grade_level,
+            subject=subject,
+            language=language,
+            difficulty=difficulty,
+            question_count=question_count,
+            include_mcq=include_mcq,
+            include_short=include_short,
+            include_long=include_long,
+            include_flashcards=include_flashcards,
+            include_summary=include_summary,
+            include_study_plan=include_study_plan,
+            source_text=source_text,
+        )
+
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.4,
+                max_output_tokens=12000,
+            ),
+        )
+
+        result = (response.text or "").strip()
+        if not result:
+            return "The AI returned an empty response. Please try again."
+
+        return result
+
+    except Exception as exc:
+        return (
+            "### Generation Error\n\n"
+            f"`{type(exc).__name__}: {exc}`\n\n"
+            "Please verify your API key, internet connection, and Gemini "
+            "model availability, then try again."
+        )
+
+
+def save_markdown(study_pack):
+    """Save generated content as a Markdown file."""
+    output_path = Path("AI_Study_Pack.md")
+    output_path.write_text(study_pack or "", encoding="utf-8")
+    return str(output_path)
+
+
+def build_gradio_app():
+    import gradio as gr
+
+    css = """
+    .title { text-align: center; }
+    .credit { text-align: center; font-size: 14px; }
+    """
+
+    with gr.Blocks(title="AI Study Pack Generator", css=css, theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# 📚 AI Study Pack Generator",
+            elem_classes=["title"],
+        )
+        gr.Markdown(
+            "Create summaries, MCQs, short questions, long questions, "
+            "flashcards and a study plan with Gemini AI.",
+            elem_classes=["title"],
+        )
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                subject = gr.Textbox(
+                    label="Subject",
+                    placeholder="e.g., Computer Science",
+                )
+                topic = gr.Textbox(
+                    label="Topic",
+                    placeholder="e.g., Artificial Intelligence",
+                )
+                grade_level = gr.Dropdown(
+                    choices=[
+                        "School - Beginner",
+                        "School - Intermediate",
+                        "School - Advanced",
+                        "College / University",
+                        "Professional",
+                    ],
+                    value="School - Intermediate",
+                    label="Grade / Level",
+                )
+                language = gr.Dropdown(
+                    choices=["English", "Urdu", "Simple English"],
+                    value="English",
+                    label="Language",
+                )
+                difficulty = gr.Dropdown(
+                    choices=["Easy", "Medium", "Hard"],
+                    value="Medium",
+                    label="Difficulty",
+                )
+                question_count = gr.Slider(
+                    minimum=3,
+                    maximum=30,
+                    value=10,
+                    step=1,
+                    label="Number of MCQs",
+                )
+
+                gr.Markdown("### Include in Study Pack")
+                include_summary = gr.Checkbox(value=True, label="Topic Summary")
+                include_mcq = gr.Checkbox(value=True, label="MCQs")
+                include_short = gr.Checkbox(value=True, label="Short Questions")
+                include_long = gr.Checkbox(value=True, label="Long Questions")
+                include_flashcards = gr.Checkbox(value=True, label="Flashcards")
+                include_study_plan = gr.Checkbox(value=True, label="7-Day Study Plan")
+
+                uploaded_file = gr.File(
+                    label="Optional Notes / Material (TXT, PDF, DOCX)",
+                    type="filepath",
+                )
+
+                generate_btn = gr.Button(
+                    "🚀 Generate Study Pack",
+                    variant="primary",
+                )
+
+            with gr.Column(scale=2):
+                output = gr.Markdown(
+                    value="Your generated study pack will appear here."
+                )
+                download_btn = gr.DownloadButton(
+                    "⬇️ Download Study Pack (.md)",
+                    visible=False,
+                )
+
+        gr.Markdown(
+            "Developed by **Shahzad Amin** | AI Study Pack Generator"
+            "",
+            elem_classes=["credit"],
+        )
+
+        def generate_and_prepare(*args):
+            pack = generate_study_pack(*args)
+            if pack.startswith("### API Key Required") or pack.startswith("### Generation Error"):
+                return pack, gr.update(visible=False, value=None)
+
+            path = save_markdown(pack)
+            return pack, gr.update(visible=True, value=path)
+
+        generate_btn.click(
+            fn=generate_and_prepare,
+            inputs=[
+                topic,
+                grade_level,
+                subject,
+                language,
+                difficulty,
+                question_count,
+                include_mcq,
+                include_short,
+                include_long,
+                include_flashcards,
+                include_summary,
+                include_study_plan,
+                uploaded_file,
+            ],
+            outputs=[output, download_btn],
+        )
+
+    return demo
+
+
+def run_gradio():
+    demo = build_gradio_app()
+    demo.launch(share=True)
+
+
+def run_streamlit():
+    import streamlit as st
+
+    st.set_page_config(
+        page_title="AI Study Pack Generator",
+        page_icon="📚",
+        layout="wide",
+    )
+
+    st.title("📚 AI Study Pack Generator")
+    st.caption(
+        "Create an AI-powered study pack using Gemini 3.8 Flash."
+    )
+
+    with st.sidebar:
+        st.header("Study Settings")
+        subject = st.text_input("Subject", "Computer Science")
+        topic = st.text_input("Topic", "Artificial Intelligence")
+        grade_level = st.selectbox(
+            "Grade / Level",
+            [
+                "School - Beginner",
+                "School - Intermediate",
+                "School - Advanced",
+                "College / University",
+                "Professional",
+            ],
+        )
+        language = st.selectbox(
+            "Language", ["English", "Urdu", "Simple English"]
+        )
+        difficulty = st.selectbox(
+            "Difficulty", ["Easy", "Medium", "Hard"], index=1
+        )
+        question_count = st.slider(
+            "Number of MCQs", 3, 30, 10
+        )
+
+        st.subheader("Include")
+        include_summary = st.checkbox("Topic Summary", True)
+        include_mcq = st.checkbox("MCQs", True)
+        include_short = st.checkbox("Short Questions", True)
+        include_long = st.checkbox("Long Questions", True)
+        include_flashcards = st.checkbox("Flashcards", True)
+        include_study_plan = st.checkbox("7-Day Study Plan", True)
+
+        uploaded = st.file_uploader(
+            "Optional Notes / Material",
+            type=["txt", "pdf", "docx"],
+            help="Upload notes to make the study pack more specific.",
+        )
+
+        generate = st.button(
+            "🚀 Generate Study Pack",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if generate:
+        temp_path = None
+
+        if uploaded:
+            suffix = Path(uploaded.name).suffix
+            temp_path = Path("uploaded_source" + suffix)
+            temp_path.write_bytes(uploaded.getvalue())
+
+        with st.spinner("Generating your study pack..."):
+            result = generate_study_pack(
+                topic,
+                grade_level,
+                subject,
+                language,
+                difficulty,
+                question_count,
+                include_mcq,
+                include_short,
+                include_long,
+                include_flashcards,
+                include_summary,
+                include_study_plan,
+                str(temp_path) if temp_path else None,
             )
-            result = getattr(response, "text", None)
-            if not result:
-                raise RuntimeError("The AI returned an empty response.")
-            return result.strip()
-        except Exception as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Gemini could not generate the study pack. Details: {last_error}")
 
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
-with st.sidebar:
-    st.header("⚙️ Study Settings")
-    language = st.selectbox("🌐 Output Language", ["English", "Simple English", "Urdu"])
-    difficulty = st.select_slider("🎯 Difficulty", ["Easy", "Medium", "Hard"], value="Medium")
+        st.markdown(result)
+
+        if not result.startswith("### API Key Required") and not result.startswith("### Generation Error"):
+            st.download_button(
+                "⬇️ Download Study Pack (.md)",
+                data=result,
+                file_name="AI_Study_Pack.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
     st.divider()
-    st.subheader("Question Settings")
-    flashcards = st.slider("🧠 Flashcards", 3, 20, 8)
-    mcqs = st.slider("❓ MCQs", 3, 20, 8)
-    shorts = st.slider("✍️ Short Questions", 2, 15, 5)
-    longs = st.slider("📝 Long / Exam Questions", 1, 10, 3)
-    st.divider()
-    st.info("AI model: Gemini 3.7 Flash\n\nGoogle currently lists a free tier for this model. Free-tier usage limits apply.")
+    st.caption("Developed by Shahzad Amin | AI Study Pack Generator")
 
-st.subheader("1️⃣ Enter Your Study Topic")
-topic = st.text_input("Topic", placeholder="Example: Artificial Intelligence, Python, Database Management, IELTS...", label_visibility="collapsed")
 
-st.subheader("2️⃣ Optional Study Material")
-uploaded_file = st.file_uploader("Upload TXT, PDF or DOCX", type=["txt", "pdf", "docx"], help="Upload lecture notes, course material or study material.")
-material = ""
-if uploaded_file is not None:
-    material, error = extract_uploaded_text(uploaded_file)
-    if error:
-        st.warning(error)
-    else:
-        st.success(f"Uploaded: {uploaded_file.name} ({len(material):,} characters extracted)")
-        with st.expander("👀 Preview extracted material"):
-            st.text_area("Preview", material[:5000], height=250, disabled=True, label_visibility="collapsed")
-
-with st.expander("✨ What this application includes"):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("""
-        <div class="feature-box">📖 <b>Topic Summary</b><br>Structured AI summary.</div>
-        <div class="feature-box">❓ <b>MCQs</b><br>Questions with answers and explanations.</div>
-        <div class="feature-box">✍️ <b>Short Questions</b><br>Questions with model answers.</div>
-        <div class="feature-box">📝 <b>Long / Exam Questions</b><br>Exam-style questions with model answers.</div>
-        <div class="feature-box">🧠 <b>Flashcards</b><br>Concise revision cards.</div>
-        """, unsafe_allow_html=True)
-    with c2:
-        st.markdown("""
-        <div class="feature-box">📅 <b>7-Day Study Plan</b><br>Day-by-day study and revision plan.</div>
-        <div class="feature-box">🎯 <b>Difficulty</b><br>Easy, Medium or Hard.</div>
-        <div class="feature-box">🌐 <b>Languages</b><br>English, Simple English or Urdu.</div>
-        <div class="feature-box">📄 <b>Uploads</b><br>TXT, PDF or DOCX study material.</div>
-        <div class="feature-box">⬇️ <b>Download</b><br>Download the complete pack as Markdown.</div>
-        """, unsafe_allow_html=True)
-
-st.divider()
-if st.button("🚀 Generate Complete Study Pack", type="primary", use_container_width=True):
-    if not topic.strip() and not material.strip():
-        st.warning("Please enter a study topic or upload study material.")
-    else:
-        with st.spinner("🤖 AI is preparing your complete study pack..."):
-            try:
-                st.session_state.study_pack = generate_study_pack(topic, material, language, difficulty, flashcards, mcqs, shorts, longs)
-                st.success("✅ Study pack generated successfully!")
-            except Exception as exc:
-                st.error(str(exc))
-                with st.expander("🔧 Troubleshooting"):
-                    st.markdown("""
-                    1. Check that your Gemini API key is correct.
-                    2. In Colab, set `GEMINI_API_KEY` before starting Streamlit.
-                    3. On Streamlit Cloud, add `GEMINI_API_KEY` in App Settings → Secrets.
-                    4. Make sure `google-genai` is installed.
-                    5. Free-tier limits may apply if you make many requests.
-                    6. Confirm that `gemini-3.7-flash` is available to your API key.
-                    """)
-
-if st.session_state.study_pack:
-    st.divider()
-    st.subheader("📖 Your AI Study Pack")
-    st.markdown(st.session_state.study_pack)
-    st.download_button("⬇️ Download Study Pack as Markdown", data=st.session_state.study_pack, file_name="AI_Study_Pack.md", mime="text/markdown", use_container_width=True)
-    if st.button("🗑️ Clear Study Pack", use_container_width=True):
-        st.session_state.study_pack = ""
-        st.rerun()
-
-st.markdown("---")
-st.markdown('<div class="credit">👨‍💻 AI Study Pack Generator — Developed by Shahzad Amin</div>', unsafe_allow_html=True)
-st.caption("Educational content is AI-generated. Verify important information against official course material.")
+# Streamlit Cloud runs the file through the Streamlit executable.
+# Running `python app.py` starts Gradio, which is convenient in Colab.
+if "streamlit" in os.path.basename(sys.argv[0]).lower():
+    run_streamlit()
+else:
+    run_gradio()
