@@ -16,7 +16,7 @@ from docx import Document
 # Streamlit + Gemini
 # ============================================================
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash"
 
 
 # ============================================================
