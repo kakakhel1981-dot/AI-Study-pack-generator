@@ -1,482 +1,1439 @@
+import streamlit as st
 import os
-import sys
-from pathlib import Path
+import json
+import re
+
+from google import genai
+from google.genai import types
+
+from pypdf import PdfReader
+from docx import Document
+
 
 # ============================================================
-# AI Study Pack Generator
-# Gradio UI for Google Colab / local development
-# Streamlit UI for Streamlit Cloud deployment
+# AI STUDY PACK GENERATOR
+# Developed by Shahzad Amin
+# Streamlit + Gemini
 # ============================================================
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL_NAME = "gemini-3.8-flash"
 
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="AI Study Pack Generator",
+    page_icon="📚",
+    layout="centered"
+)
+
+
+# ============================================================
+# CUSTOM CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+
+    .stApp {
+        background-color: #f8f9fb;
+    }
+
+    .main .block-container {
+        max-width: 850px;
+        padding-top: 25px;
+        padding-bottom: 50px;
+    }
+
+    /* Main title */
+
+    .main-title {
+        text-align: center;
+        font-size: 32px;
+        font-weight: 700;
+        color: #5b5cf6;
+        margin-bottom: 5px;
+    }
+
+    .sub-title {
+        text-align: center;
+        color: #777;
+        font-size: 16px;
+        margin-bottom: 25px;
+    }
+
+    /* Settings card */
+
+    .settings-card {
+        background: white;
+        padding: 22px;
+        border-radius: 16px;
+        box-shadow: 0px 3px 15px rgba(0,0,0,0.06);
+        margin-bottom: 20px;
+    }
+
+    /* Field labels */
+
+    .field-label {
+        display: inline-block;
+        background-color: #e7e8ff;
+        color: #5b5cf6;
+        font-size: 16px;
+        font-weight: 700;
+        padding: 5px 9px;
+        border-radius: 7px;
+        margin-top: 10px;
+        margin-bottom: 5px;
+    }
+
+    /* Section headings */
+
+    .section-heading {
+        font-size: 22px;
+        font-weight: 700;
+        color: #202124;
+        margin-top: 25px;
+        margin-bottom: 12px;
+    }
+
+    /* Output cards */
+
+    .output-card {
+        background: white;
+        border-radius: 14px;
+        padding: 18px;
+        margin-bottom: 14px;
+        border: 1px solid #eeeeee;
+        box-shadow: 0px 2px 10px rgba(0,0,0,0.04);
+    }
+
+    .output-title {
+        color: #5b5cf6;
+        font-size: 18px;
+        font-weight: 700;
+        margin-bottom: 8px;
+    }
+
+    .question {
+        font-size: 16px;
+        font-weight: 600;
+        color: #222;
+    }
+
+    .answer {
+        margin-top: 8px;
+        color: #333;
+    }
+
+    .answer-label {
+        color: #5b5cf6;
+        font-weight: 700;
+    }
+
+    .credit {
+        text-align: center;
+        color: #888;
+        margin-top: 35px;
+        font-size: 14px;
+    }
+
+    /* Buttons */
+
+    .stButton > button {
+        border-radius: 10px;
+        min-height: 45px;
+        font-weight: 700;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# API KEY
+# ============================================================
 
 def get_api_key():
-    """Read the Gemini API key from environment variables or Streamlit secrets."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    try:
+        key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        key = ""
 
     if not key:
-        try:
-            import streamlit as st
-            key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-        except Exception:
-            pass
+        key = os.getenv("GEMINI_API_KEY", "")
 
     return key
 
 
-def extract_uploaded_file(file_path):
-    """Extract text from TXT, PDF, or DOCX files."""
-    if not file_path:
+# ============================================================
+# FILE READER
+# ============================================================
+
+def read_uploaded_file(uploaded_file):
+
+    if uploaded_file is None:
         return ""
 
-    path = Path(file_path)
-    suffix = path.suffix.lower()
+    filename = uploaded_file.name.lower()
 
     try:
-        if suffix == ".txt":
-            return path.read_text(encoding="utf-8", errors="ignore")
 
-        if suffix == ".pdf":
-            from pypdf import PdfReader
-            reader = PdfReader(str(path))
-            pages = []
+        # TXT
+        if filename.endswith(".txt"):
+            return uploaded_file.getvalue().decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        # PDF
+        elif filename.endswith(".pdf"):
+
+            reader = PdfReader(uploaded_file)
+
+            text = ""
+
             for page in reader.pages:
-                pages.append(page.extract_text() or "")
-            return "\n".join(pages)
+                page_text = page.extract_text()
 
-        if suffix == ".docx":
-            from docx import Document
-            doc = Document(str(path))
-            return "\n".join(p.text for p in doc.paragraphs)
+                if page_text:
+                    text += page_text + "\n"
 
-        return ""
-    except Exception as exc:
-        raise ValueError(f"Could not read the uploaded file: {exc}") from exc
+            return text
+
+        # DOCX
+        elif filename.endswith(".docx"):
+
+            document = Document(uploaded_file)
+
+            text = ""
+
+            for paragraph in document.paragraphs:
+                text += paragraph.text + "\n"
+
+            return text
+
+    except Exception as e:
+
+        st.error(
+            f"Could not read the uploaded file: {e}"
+        )
+
+    return ""
 
 
-def build_prompt(
-    topic,
-    grade_level,
+# ============================================================
+# JSON CLEANER
+# ============================================================
+
+def clean_json(response_text):
+
+    text = response_text.strip()
+
+    # Remove ```json
+    text = re.sub(
+        r"^```json",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # Remove ```
+    text = re.sub(
+        r"```$",
+        "",
+        text
+    )
+
+    text = text.strip()
+
+    # Find JSON object
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1:
+
+        text = text[start:end + 1]
+
+    return text
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+def create_prompt(
     subject,
+    topic,
+    grade,
     language,
     difficulty,
-    question_count,
-    include_mcq,
-    include_short,
-    include_long,
-    include_flashcards,
-    include_summary,
-    include_study_plan,
-    source_text,
+    mcq_count,
+    short_count,
+    long_count,
+    flashcard_count,
+    study_material
 ):
-    sections = []
 
-    if include_summary:
-        sections.append("1. Topic Summary")
-    if include_mcq:
-        sections.append("2. Multiple Choice Questions (MCQs)")
-    if include_short:
-        sections.append("3. Short Answer Questions")
-    if include_long:
-        sections.append("4. Long Answer / Exam Questions")
-    if include_flashcards:
-        sections.append("5. Flashcards")
-    if include_study_plan:
-        sections.append("6. 7-Day Study Plan")
+    material = study_material[:30000]
 
-    if not sections:
-        sections.append("1. Topic Summary")
+    prompt = f"""
 
-    source_section = ""
-    if source_text.strip():
-        # Keep very large uploads manageable.
-        source_text = source_text.strip()[:50000]
-        source_section = f"""
-SOURCE MATERIAL PROVIDED BY THE STUDENT
-Use the following material as the primary reference. Do not invent facts
-that conflict with it.
+You are an expert teacher and examination preparation assistant.
 
---- SOURCE START ---
-{source_text}
---- SOURCE END ---
+Create a complete study pack.
+
+SUBJECT:
+{subject}
+
+TOPIC:
+{topic}
+
+GRADE / LEVEL:
+{grade}
+
+LANGUAGE:
+{language}
+
+DIFFICULTY:
+{difficulty}
+
+NUMBER OF MCQs:
+{mcq_count}
+
+NUMBER OF SHORT QUESTIONS:
+{short_count}
+
+NUMBER OF LONG QUESTIONS:
+{long_count}
+
+NUMBER OF FLASHCARDS:
+{flashcard_count}
+
+
+OPTIONAL STUDY MATERIAL:
+
+{material if material else "No study material was uploaded."}
+
+
+IMPORTANT INSTRUCTIONS:
+
+1. Create accurate educational content.
+2. Keep the difficulty appropriate for the selected level.
+3. Use clear exam-friendly language.
+4. If Urdu is selected, write the answers in Urdu.
+5. If Simple English is selected, use simple English.
+6. MCQs must have four options.
+7. Provide correct answers and explanations.
+8. Provide useful model answers.
+9. Create exactly 7 days in the study plan.
+10. Return ONLY valid JSON.
+11. Do not add Markdown outside the JSON.
+
+
+RETURN THIS EXACT JSON STRUCTURE:
+
+{{
+    "summary": "Topic summary",
+
+    "key_concepts": [
+        "Concept 1",
+        "Concept 2",
+        "Concept 3"
+    ],
+
+    "important_terms": [
+        {{
+            "term": "Term",
+            "meaning": "Meaning"
+        }}
+    ],
+
+    "mcqs": [
+        {{
+            "question": "Question",
+            "options": [
+                "A",
+                "B",
+                "C",
+                "D"
+            ],
+            "answer": "Correct option",
+            "explanation": "Explanation"
+        }}
+    ],
+
+    "short_questions": [
+        {{
+            "question": "Question",
+            "answer": "Model answer"
+        }}
+    ],
+
+    "long_questions": [
+        {{
+            "question": "Exam question",
+            "answer": "Detailed model answer"
+        }}
+    ],
+
+    "flashcards": [
+        {{
+            "front": "Question or term",
+            "back": "Answer or definition"
+        }}
+    ],
+
+    "study_plan": [
+        {{
+            "day": "Day 1",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 2",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 3",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 4",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 5",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 6",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }},
+        {{
+            "day": "Day 7",
+            "topics": "Topics",
+            "activities": "Activities",
+            "revision": "Revision"
+        }}
+    ],
+
+    "exam_tips": [
+        "Tip 1",
+        "Tip 2",
+        "Tip 3"
+    ],
+
+    "revision_checklist": [
+        "Revision item 1",
+        "Revision item 2",
+        "Revision item 3"
+    ]
+}}
+
 """
 
-    return f"""
-You are an expert teacher, curriculum designer, and exam-preparation coach.
-
-Create a high-quality AI Study Pack for the student.
-
-STUDENT SETTINGS
-- Subject: {subject}
-- Topic: {topic}
-- Grade / Level: {grade_level}
-- Language: {language}
-- Difficulty: {difficulty}
-- Number of MCQs requested: {question_count}
-
-REQUIRED SECTIONS
-{chr(10).join(sections)}
-
-QUALITY RULES
-- Keep the content appropriate for the stated grade/level.
-- Use clear, simple language unless the level requires technical language.
-- Focus on understanding, revision, and exam preparation.
-- Do not make up references, quotations, statistics, or facts.
-- If source material is provided, prioritize it.
-- Make questions meaningful rather than repetitive.
-- Put the answer immediately after each MCQ as "Answer: X" and give a
-  one-sentence explanation.
-- For short and long questions, provide concise model answers.
-- Flashcards should use a clear "Q:" and "A:" format.
-- The study plan should be practical and achievable.
-- Use Markdown headings and bullet points.
-- Finish with a short "Exam Tips" section containing 5 practical tips.
-
-CONTENT REQUIREMENTS
-- Summary: key concepts, definitions, important points, and examples.
-- MCQs: exactly {question_count} questions if MCQs are selected.
-- Short questions: approximately 5 questions if selected.
-- Long questions: approximately 3 questions if selected.
-- Flashcards: approximately 10 cards if selected.
-- Study plan: 7 daily sessions if selected.
-
-Return ONLY the finished study pack in Markdown. Do not describe your process.
-{source_section}
-"""
+    return prompt
 
 
-def generate_study_pack(
-    topic,
-    grade_level,
-    subject,
-    language,
-    difficulty,
-    question_count,
-    include_mcq,
-    include_short,
-    include_long,
-    include_flashcards,
-    include_summary,
-    include_study_plan,
-    uploaded_file=None,
-):
-    topic = (topic or "").strip()
-    subject = (subject or "").strip()
-    grade_level = (grade_level or "").strip()
-    language = (language or "English").strip()
-    difficulty = (difficulty or "Medium").strip()
+# ============================================================
+# GENERATE CONTENT
+# ============================================================
 
-    if not topic:
-        return "Please enter a topic."
-    if not subject:
-        return "Please enter a subject."
-
-    try:
-        question_count = int(question_count)
-    except (TypeError, ValueError):
-        question_count = 10
-
-    question_count = max(3, min(question_count, 30))
-
-    source_text = ""
-    if uploaded_file:
-        source_text = extract_uploaded_file(uploaded_file)
+def generate_study_pack(prompt):
 
     api_key = get_api_key()
+
     if not api_key:
-        return (
-            "### API Key Required\n\n"
-            "Please set `GEMINI_API_KEY` before generating a study pack.\n\n"
-            "**Google Colab:** run the API-key cell shown in the guide.\n\n"
-            "**Streamlit Cloud:** add `GEMINI_API_KEY` under "
-            "**App settings → Secrets**."
+
+        raise ValueError(
+            "GEMINI_API_KEY is missing. "
+            "Please add it in Streamlit Secrets."
         )
 
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
-
-        prompt = build_prompt(
-            topic=topic,
-            grade_level=grade_level,
-            subject=subject,
-            language=language,
-            difficulty=difficulty,
-            question_count=question_count,
-            include_mcq=include_mcq,
-            include_short=include_short,
-            include_long=include_long,
-            include_flashcards=include_flashcards,
-            include_summary=include_summary,
-            include_study_plan=include_study_plan,
-            source_text=source_text,
-        )
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.4,
-                max_output_tokens=12000,
-            ),
-        )
-
-        result = (response.text or "").strip()
-        if not result:
-            return "The AI returned an empty response. Please try again."
-
-        return result
-
-    except Exception as exc:
-        return (
-            "### Generation Error\n\n"
-            f"`{type(exc).__name__}: {exc}`\n\n"
-            "Please verify your API key, internet connection, and Gemini "
-            "model availability, then try again."
-        )
-
-
-def save_markdown(study_pack):
-    """Save generated content as a Markdown file."""
-    output_path = Path("AI_Study_Pack.md")
-    output_path.write_text(study_pack or "", encoding="utf-8")
-    return str(output_path)
-
-
-def build_gradio_app():
-    import gradio as gr
-
-    css = """
-    .title { text-align: center; }
-    .credit { text-align: center; font-size: 14px; }
-    """
-
-    with gr.Blocks(title="AI Study Pack Generator", css=css, theme=gr.themes.Soft()) as demo:
-        gr.Markdown(
-            "# 📚 AI Study Pack Generator",
-            elem_classes=["title"],
-        )
-        gr.Markdown(
-            "Create summaries, MCQs, short questions, long questions, "
-            "flashcards and a study plan with Gemini AI.",
-            elem_classes=["title"],
-        )
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                subject = gr.Textbox(
-                    label="Subject",
-                    placeholder="e.g., Computer Science",
-                )
-                topic = gr.Textbox(
-                    label="Topic",
-                    placeholder="e.g., Artificial Intelligence",
-                )
-                grade_level = gr.Dropdown(
-                    choices=[
-                        "School - Beginner",
-                        "School - Intermediate",
-                        "School - Advanced",
-                        "College / University",
-                        "Professional",
-                    ],
-                    value="School - Intermediate",
-                    label="Grade / Level",
-                )
-                language = gr.Dropdown(
-                    choices=["English", "Urdu", "Simple English"],
-                    value="English",
-                    label="Language",
-                )
-                difficulty = gr.Dropdown(
-                    choices=["Easy", "Medium", "Hard"],
-                    value="Medium",
-                    label="Difficulty",
-                )
-                question_count = gr.Slider(
-                    minimum=3,
-                    maximum=30,
-                    value=10,
-                    step=1,
-                    label="Number of MCQs",
-                )
-
-                gr.Markdown("### Include in Study Pack")
-                include_summary = gr.Checkbox(value=True, label="Topic Summary")
-                include_mcq = gr.Checkbox(value=True, label="MCQs")
-                include_short = gr.Checkbox(value=True, label="Short Questions")
-                include_long = gr.Checkbox(value=True, label="Long Questions")
-                include_flashcards = gr.Checkbox(value=True, label="Flashcards")
-                include_study_plan = gr.Checkbox(value=True, label="7-Day Study Plan")
-
-                uploaded_file = gr.File(
-                    label="Optional Notes / Material (TXT, PDF, DOCX)",
-                    type="filepath",
-                )
-
-                generate_btn = gr.Button(
-                    "🚀 Generate Study Pack",
-                    variant="primary",
-                )
-
-            with gr.Column(scale=2):
-                output = gr.Markdown(
-                    value="Your generated study pack will appear here."
-                )
-                download_btn = gr.DownloadButton(
-                    "⬇️ Download Study Pack (.md)",
-                    visible=False,
-                )
-
-        gr.Markdown(
-            "Developed by **Shahzad Amin** | AI Study Pack Generator"
-            "",
-            elem_classes=["credit"],
-        )
-
-        def generate_and_prepare(*args):
-            pack = generate_study_pack(*args)
-            if pack.startswith("### API Key Required") or pack.startswith("### Generation Error"):
-                return pack, gr.update(visible=False, value=None)
-
-            path = save_markdown(pack)
-            return pack, gr.update(visible=True, value=path)
-
-        generate_btn.click(
-            fn=generate_and_prepare,
-            inputs=[
-                topic,
-                grade_level,
-                subject,
-                language,
-                difficulty,
-                question_count,
-                include_mcq,
-                include_short,
-                include_long,
-                include_flashcards,
-                include_summary,
-                include_study_plan,
-                uploaded_file,
-            ],
-            outputs=[output, download_btn],
-        )
-
-    return demo
-
-
-def run_gradio():
-    demo = build_gradio_app()
-    demo.launch(share=True)
-
-
-def run_streamlit():
-    import streamlit as st
-
-    st.set_page_config(
-        page_title="AI Study Pack Generator",
-        page_icon="📚",
-        layout="wide",
+    client = genai.Client(
+        api_key=api_key
     )
 
-    st.title("📚 AI Study Pack Generator")
-    st.caption(
-        "Create an AI-powered study pack using Gemini 3.8 Flash."
+    response = client.models.generate_content(
+
+        model=MODEL_NAME,
+
+        contents=prompt,
+
+        config=types.GenerateContentConfig(
+
+            temperature=0.4,
+
+            max_output_tokens=14000,
+
+            response_mime_type="application/json"
+        )
     )
 
-    with st.sidebar:
-        st.header("Study Settings")
-        subject = st.text_input("Subject", "Computer Science")
-        topic = st.text_input("Topic", "Artificial Intelligence")
-        grade_level = st.selectbox(
-            "Grade / Level",
-            [
-                "School - Beginner",
-                "School - Intermediate",
-                "School - Advanced",
-                "College / University",
-                "Professional",
-            ],
-        )
-        language = st.selectbox(
-            "Language", ["English", "Urdu", "Simple English"]
-        )
-        difficulty = st.selectbox(
-            "Difficulty", ["Easy", "Medium", "Hard"], index=1
-        )
-        question_count = st.slider(
-            "Number of MCQs", 3, 30, 10
+    json_text = clean_json(response.text)
+
+    return json.loads(json_text)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    '<div class="main-title">📚 AI Study Pack Generator</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="sub-title">'
+    'Create summaries, MCQs, questions, flashcards and a 7-day study plan'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# INPUT CARD
+# ============================================================
+
+st.markdown(
+    '<div class="settings-card">',
+    unsafe_allow_html=True
+)
+
+
+# SUBJECT
+
+st.markdown(
+    '<div class="field-label">Subject</div>',
+    unsafe_allow_html=True
+)
+
+subject = st.text_input(
+    "Subject",
+    value="Computer",
+    label_visibility="collapsed"
+)
+
+
+# TOPIC
+
+st.markdown(
+    '<div class="field-label">Topic</div>',
+    unsafe_allow_html=True
+)
+
+topic = st.text_input(
+    "Topic",
+    value="Artificial Intelligence",
+    label_visibility="collapsed"
+)
+
+
+# GRADE
+
+st.markdown(
+    '<div class="field-label">Grade / Level</div>',
+    unsafe_allow_html=True
+)
+
+grade = st.selectbox(
+    "Grade / Level",
+    [
+        "School - Beginner",
+        "School - Intermediate",
+        "School - Advanced",
+        "College / University",
+        "Professional"
+    ],
+    index=1,
+    label_visibility="collapsed"
+)
+
+
+# LANGUAGE
+
+st.markdown(
+    '<div class="field-label">Language</div>',
+    unsafe_allow_html=True
+)
+
+language = st.selectbox(
+    "Language",
+    [
+        "English",
+        "Urdu",
+        "Simple English"
+    ],
+    label_visibility="collapsed"
+)
+
+
+# DIFFICULTY
+
+st.markdown(
+    '<div class="field-label">Difficulty</div>',
+    unsafe_allow_html=True
+)
+
+difficulty = st.selectbox(
+    "Difficulty",
+    [
+        "Easy",
+        "Medium",
+        "Hard"
+    ],
+    index=1,
+    label_visibility="collapsed"
+)
+
+
+# MCQ COUNT
+
+st.markdown(
+    '<div class="field-label">Number of MCQs</div>',
+    unsafe_allow_html=True
+)
+
+mcq_count = st.slider(
+    "Number of MCQs",
+    min_value=3,
+    max_value=30,
+    value=10,
+    label_visibility="collapsed"
+)
+
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ============================================================
+# INCLUDE IN STUDY PACK
+# ============================================================
+
+st.markdown(
+    '<div class="section-heading">Include in Study Pack</div>',
+    unsafe_allow_html=True
+)
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    include_summary = st.checkbox(
+        "📖 Topic Summary",
+        value=True
+    )
+
+    include_mcqs = st.checkbox(
+        "❓ MCQs with Answers",
+        value=True
+    )
+
+    include_short = st.checkbox(
+        "✍️ Short-Answer Questions",
+        value=True
+    )
+
+    include_long = st.checkbox(
+        "📝 Long / Exam Questions",
+        value=True
+    )
+
+
+with col2:
+
+    include_flashcards = st.checkbox(
+        "🧠 Flashcards",
+        value=True
+    )
+
+    include_plan = st.checkbox(
+        "📅 7-Day Study Plan",
+        value=True
+    )
+
+    include_tips = st.checkbox(
+        "🎯 Exam Tips",
+        value=True
+    )
+
+    include_checklist = st.checkbox(
+        "✅ Revision Checklist",
+        value=True
+    )
+
+
+# ============================================================
+# ADVANCED OPTIONS
+# ============================================================
+
+with st.expander("⚙️ Advanced Options"):
+
+    short_count = st.slider(
+        "Number of Short Questions",
+        3,
+        15,
+        5
+    )
+
+    long_count = st.slider(
+        "Number of Long Questions",
+        2,
+        10,
+        3
+    )
+
+    flashcard_count = st.slider(
+        "Number of Flashcards",
+        5,
+        30,
+        10
+    )
+
+
+# ============================================================
+# FILE UPLOAD
+# ============================================================
+
+st.markdown(
+    '<div class="section-heading">📄 Optional Study Material</div>',
+    unsafe_allow_html=True
+)
+
+uploaded_file = st.file_uploader(
+    "Upload TXT, PDF or DOCX",
+    type=[
+        "txt",
+        "pdf",
+        "docx"
+    ]
+)
+
+
+# ============================================================
+# GENERATE BUTTON
+# ============================================================
+
+generate_button = st.button(
+    "✨ Generate Study Pack",
+    type="primary",
+    use_container_width=True
+)
+
+
+# ============================================================
+# GENERATE
+# ============================================================
+
+if generate_button:
+
+    if not subject.strip():
+
+        st.warning(
+            "Please enter a subject."
         )
 
-        st.subheader("Include")
-        include_summary = st.checkbox("Topic Summary", True)
-        include_mcq = st.checkbox("MCQs", True)
-        include_short = st.checkbox("Short Questions", True)
-        include_long = st.checkbox("Long Questions", True)
-        include_flashcards = st.checkbox("Flashcards", True)
-        include_study_plan = st.checkbox("7-Day Study Plan", True)
+        st.stop()
 
-        uploaded = st.file_uploader(
-            "Optional Notes / Material",
-            type=["txt", "pdf", "docx"],
-            help="Upload notes to make the study pack more specific.",
+
+    if not topic.strip():
+
+        st.warning(
+            "Please enter a topic."
         )
 
-        generate = st.button(
-            "🚀 Generate Study Pack",
-            type="primary",
-            use_container_width=True,
+        st.stop()
+
+
+    study_material = ""
+
+    if uploaded_file:
+
+        study_material = read_uploaded_file(
+            uploaded_file
         )
 
-    if generate:
-        temp_path = None
 
-        if uploaded:
-            suffix = Path(uploaded.name).suffix
-            temp_path = Path("uploaded_source" + suffix)
-            temp_path.write_bytes(uploaded.getvalue())
+    prompt = create_prompt(
 
-        with st.spinner("Generating your study pack..."):
+        subject=subject,
+
+        topic=topic,
+
+        grade=grade,
+
+        language=language,
+
+        difficulty=difficulty,
+
+        mcq_count=mcq_count,
+
+        short_count=short_count,
+
+        long_count=long_count,
+
+        flashcard_count=flashcard_count,
+
+        study_material=study_material
+    )
+
+
+    with st.spinner(
+        "Creating your study pack..."
+    ):
+
+        try:
+
             result = generate_study_pack(
-                topic,
-                grade_level,
-                subject,
-                language,
-                difficulty,
-                question_count,
-                include_mcq,
-                include_short,
-                include_long,
-                include_flashcards,
-                include_summary,
-                include_study_plan,
-                str(temp_path) if temp_path else None,
+                prompt
             )
 
-        if temp_path and temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+            st.session_state.study_pack = result
 
-        st.markdown(result)
-
-        if not result.startswith("### API Key Required") and not result.startswith("### Generation Error"):
-            st.download_button(
-                "⬇️ Download Study Pack (.md)",
-                data=result,
-                file_name="AI_Study_Pack.md",
-                mime="text/markdown",
-                use_container_width=True,
+            st.success(
+                "Study pack generated successfully!"
             )
 
-    st.divider()
-    st.caption("Developed by Shahzad Amin | AI Study Pack Generator")
+        except Exception as e:
+
+            st.error(
+                f"Error generating study pack: {e}"
+            )
 
 
-# Streamlit Cloud runs the file through the Streamlit executable.
-# Running `python app.py` starts Gradio, which is convenient in Colab.
-if "streamlit" in os.path.basename(sys.argv[0]).lower():
-    run_streamlit()
-else:
-    run_gradio()
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+
+if "study_pack" in st.session_state:
+
+    data = st.session_state.study_pack
+
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    if include_summary:
+
+        st.markdown(
+            '<div class="section-heading">📖 Topic Summary</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            f"""
+            <div class="output-card">
+
+                <div class="output-title">
+                    Topic Summary
+                </div>
+
+                <div>
+                    {data.get("summary", "")}
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+    # --------------------------------------------------------
+    # KEY CONCEPTS
+    # --------------------------------------------------------
+
+    st.markdown(
+        '<div class="section-heading">🔑 Key Concepts</div>',
+        unsafe_allow_html=True
+    )
+
+    concepts = data.get(
+        "key_concepts",
+        []
+    )
+
+    for i, concept in enumerate(
+        concepts,
+        start=1
+    ):
+
+        st.markdown(
+            f"""
+            <div class="output-card">
+
+                <div class="output-title">
+                    Concept {i}
+                </div>
+
+                {concept}
+
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+    # --------------------------------------------------------
+    # IMPORTANT TERMS
+    # --------------------------------------------------------
+
+    st.markdown(
+        '<div class="section-heading">📚 Important Terms</div>',
+        unsafe_allow_html=True
+    )
+
+    for item in data.get(
+        "important_terms",
+        []
+    ):
+
+        st.markdown(
+            f"""
+            <div class="output-card">
+
+                <div class="output-title">
+                    {item.get("term", "")}
+                </div>
+
+                <div>
+                    {item.get("meaning", "")}
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+    # --------------------------------------------------------
+    # MCQs
+    # --------------------------------------------------------
+
+    if include_mcqs:
+
+        st.markdown(
+            '<div class="section-heading">❓ MCQs</div>',
+            unsafe_allow_html=True
+        )
+
+        for i, mcq in enumerate(
+            data.get("mcqs", []),
+            start=1
+        ):
+
+            options_html = ""
+
+            for option in mcq.get(
+                "options",
+                []
+            ):
+
+                options_html += (
+                    f"<div>• {option}</div>"
+                )
+
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+
+                    <div class="output-title">
+                        MCQ {i}
+                    </div>
+
+                    <div class="question">
+                        {mcq.get("question", "")}
+                    </div>
+
+                    <br>
+
+                    {options_html}
+
+                    <div class="answer">
+                        <span class="answer-label">
+                            Correct Answer:
+                        </span>
+                        {mcq.get("answer", "")}
+                    </div>
+
+                    <div class="answer">
+                        <span class="answer-label">
+                            Explanation:
+                        </span>
+                        {mcq.get("explanation", "")}
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # SHORT QUESTIONS
+    # --------------------------------------------------------
+
+    if include_short:
+
+        st.markdown(
+            '<div class="section-heading">✍️ Short-Answer Questions</div>',
+            unsafe_allow_html=True
+        )
+
+        for i, item in enumerate(
+            data.get(
+                "short_questions",
+                []
+            ),
+            start=1
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+
+                    <div class="output-title">
+                        Question {i}
+                    </div>
+
+                    <div class="question">
+                        {item.get("question", "")}
+                    </div>
+
+                    <div class="answer">
+
+                        <span class="answer-label">
+                            Model Answer:
+                        </span>
+
+                        {item.get("answer", "")}
+
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # LONG QUESTIONS
+    # --------------------------------------------------------
+
+    if include_long:
+
+        st.markdown(
+            '<div class="section-heading">📝 Long / Exam Questions</div>',
+            unsafe_allow_html=True
+        )
+
+        for i, item in enumerate(
+            data.get(
+                "long_questions",
+                []
+            ),
+            start=1
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+
+                    <div class="output-title">
+                        Exam Question {i}
+                    </div>
+
+                    <div class="question">
+                        {item.get("question", "")}
+                    </div>
+
+                    <div class="answer">
+
+                        <span class="answer-label">
+                            Model Answer:
+                        </span>
+
+                        {item.get("answer", "")}
+
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # FLASHCARDS
+    # --------------------------------------------------------
+
+    if include_flashcards:
+
+        st.markdown(
+            '<div class="section-heading">🧠 Flashcards</div>',
+            unsafe_allow_html=True
+        )
+
+        for i, card in enumerate(
+            data.get(
+                "flashcards",
+                []
+            ),
+            start=1
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+
+                    <div class="output-title">
+                        Flashcard {i}
+                    </div>
+
+                    <div>
+                        <b>Front:</b>
+                        {card.get("front", "")}
+                    </div>
+
+                    <br>
+
+                    <div>
+                        <span class="answer-label">
+                            Back:
+                        </span>
+
+                        {card.get("back", "")}
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # 7 DAY STUDY PLAN
+    # --------------------------------------------------------
+
+    if include_plan:
+
+        st.markdown(
+            '<div class="section-heading">📅 7-Day Study Plan</div>',
+            unsafe_allow_html=True
+        )
+
+        for day in data.get(
+            "study_plan",
+            []
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+
+                    <div class="output-title">
+                        {day.get("day", "")}
+                    </div>
+
+                    <b>Topics:</b>
+                    {day.get("topics", "")}
+
+                    <br><br>
+
+                    <b>Activities:</b>
+                    {day.get("activities", "")}
+
+                    <br><br>
+
+                    <b>Revision:</b>
+                    {day.get("revision", "")}
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # EXAM TIPS
+    # --------------------------------------------------------
+
+    if include_tips:
+
+        st.markdown(
+            '<div class="section-heading">🎯 Exam Tips</div>',
+            unsafe_allow_html=True
+        )
+
+        for tip in data.get(
+            "exam_tips",
+            []
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+                    ✅ {tip}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # --------------------------------------------------------
+    # REVISION CHECKLIST
+    # --------------------------------------------------------
+
+    if include_checklist:
+
+        st.markdown(
+            '<div class="section-heading">✅ Revision Checklist</div>',
+            unsafe_allow_html=True
+        )
+
+        for item in data.get(
+            "revision_checklist",
+            []
+        ):
+
+            st.markdown(
+                f"""
+                <div class="output-card">
+                    ☐ {item}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # ========================================================
+    # DOWNLOAD MARKDOWN
+    # ========================================================
+
+    markdown_text = f"""# AI Study Pack
+
+## Subject
+{subject}
+
+## Topic
+{topic}
+
+## Grade / Level
+{grade}
+
+## Language
+{language}
+
+## Difficulty
+{difficulty}
+
+
+# Topic Summary
+
+{data.get("summary", "")}
+
+
+# Key Concepts
+
+"""
+
+    for concept in data.get(
+        "key_concepts",
+        []
+    ):
+
+        markdown_text += (
+            f"- {concept}\n"
+        )
+
+
+    markdown_text += "\n# MCQs\n\n"
+
+
+    for i, mcq in enumerate(
+        data.get("mcqs", []),
+        start=1
+    ):
+
+        markdown_text += (
+            f"## MCQ {i}\n"
+            f"{mcq.get('question', '')}\n\n"
+        )
+
+        for option in mcq.get(
+            "options",
+            []
+        ):
+
+            markdown_text += (
+                f"- {option}\n"
+            )
+
+        markdown_text += (
+            f"\n**Answer:** "
+            f"{mcq.get('answer', '')}\n\n"
+        )
+
+        markdown_text += (
+            f"**Explanation:** "
+            f"{mcq.get('explanation', '')}\n\n"
+        )
+
+
+    markdown_text += (
+        "\n# Short Questions\n\n"
+    )
+
+
+    for i, item in enumerate(
+        data.get(
+            "short_questions",
+            []
+        ),
+        start=1
+    ):
+
+        markdown_text += (
+            f"## Question {i}\n"
+            f"{item.get('question', '')}\n\n"
+            f"**Answer:** "
+            f"{item.get('answer', '')}\n\n"
+        )
+
+
+    markdown_text += (
+        "\n# Long / Exam Questions\n\n"
+    )
+
+
+    for i, item in enumerate(
+        data.get(
+            "long_questions",
+            []
+        ),
+        start=1
+    ):
+
+        markdown_text += (
+            f"## Exam Question {i}\n"
+            f"{item.get('question', '')}\n\n"
+            f"**Model Answer:** "
+            f"{item.get('answer', '')}\n\n"
+        )
+
+
+    markdown_text += (
+        "\n# Flashcards\n\n"
+    )
+
+
+    for i, card in enumerate(
+        data.get(
+            "flashcards",
+            []
+        ),
+        start=1
+    ):
+
+        markdown_text += (
+            f"## Flashcard {i}\n"
+            f"**Front:** {card.get('front', '')}\n\n"
+            f"**Back:** {card.get('back', '')}\n\n"
+        )
+
+
+    markdown_text += (
+        "\n# 7-Day Study Plan\n\n"
+    )
+
+
+    for day in data.get(
+        "study_plan",
+        []
+    ):
+
+        markdown_text += (
+            f"## {day.get('day', '')}\n"
+            f"**Topics:** {day.get('topics', '')}\n\n"
+            f"**Activities:** {day.get('activities', '')}\n\n"
+            f"**Revision:** {day.get('revision', '')}\n\n"
+        )
+
+
+    markdown_text += (
+        "\n# Exam Tips\n\n"
+    )
+
+
+    for tip in data.get(
+        "exam_tips",
+        []
+    ):
+
+        markdown_text += (
+            f"- {tip}\n"
+        )
+
+
+    markdown_text += (
+        "\n\n# Revision Checklist\n\n"
+    )
+
+
+    for item in data.get(
+        "revision_checklist",
+        []
+    ):
+
+        markdown_text += (
+            f"- [ ] {item}\n"
+        )
+
+
+    markdown_text += (
+        "\n\n---\n"
+        "Developed by Shahzad Amin"
+    )
+
+
+    st.download_button(
+
+        label="⬇️ Download Study Pack",
+
+        data=markdown_text,
+
+        file_name="AI_Study_Pack.md",
+
+        mime="text/markdown",
+
+        use_container_width=True
+    )
+
+
+# ============================================================
+# CREDIT
+# ============================================================
+
+st.markdown(
+    '<div class="credit">Developed by Shahzad Amin</div>',
+    unsafe_allow_html=True
+)
